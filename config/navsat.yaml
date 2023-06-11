@@ -1,0 +1,12 @@
+frequency: 20
+delay: 5.0
+#magnetic_declination_radians: 0
+magnetic_declination_radians: 0.0846 #
+#yaw_offset: 0.0
+zero_altitude: falses
+broadcast_utm_transform: true
+broadcast_utm_transform_as_parent_frame: false
+publish_filtered_gps: true
+#yaw_offset: -3,1415926
+yaw_offset: -1.5707963
+#yaw_offset: 0.0
