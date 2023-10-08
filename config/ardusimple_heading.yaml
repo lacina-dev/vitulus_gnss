@@ -1,11 +1,11 @@
 debug: 1                    # Range 0-4 (0 means no debug statements will print)
 
-device: /dev/gnss
-frame_id: gnss #TODO: change it in the future
+device: /dev/gnss_heading
+frame_id: gnss_heading
 config_on_startup: false
 uart1:
   baudrate: 460800
-rate: 20
-nav_rate: 1
+rate: 10
+nav_rate: 10
 publish:
   all: true

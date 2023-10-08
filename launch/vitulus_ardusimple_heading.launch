@@ -1,6 +1,7 @@
 <launch>
-  <arg name="node_name" default="gnss_lite"/>
-  <arg name="param_path" default="$(find vitulus_gnss)/config/ardusimple_lite.yaml" />
+
+  <arg name="node_name" default="gnss_heading"/>
+  <arg name="param_path" default="$(find vitulus_gnss)/config/ardusimple_heading.yaml" />
   <arg name="output" default="screen" />
   <arg name="respawn" default="true" />
   <arg name="respawn_delay" default="10" />
@@ -14,6 +15,8 @@
     <rosparam command="load" file="$(arg param_path)" />
   </node>
 
-  <node pkg="tf" type="static_transform_publisher" name="base_gnsslite" args="-0.160 0.21 0.3 -1.5707963 0 0 /base_link /gnsslite 50"/>
+<!--  <node pkg="tf" type="static_transform_publisher" name="base_gnss" args="-0.160 -0.21 0.3 -1.5707963 0 0 /base_link /gnss 1"/>-->
+
+
 
 </launch>
