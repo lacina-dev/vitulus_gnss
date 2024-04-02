@@ -1,4 +1,4 @@
-debug: 1                    # Range 0-4 (0 means no debug statements will print)
+debug: 0                # Range 0-4 (0 means no debug statements will print)
 
 device: /dev/gnss_heading
 frame_id: gnss_heading
