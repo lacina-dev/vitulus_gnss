@@ -5,7 +5,7 @@ frame_id: gnss
 config_on_startup: false
 uart1:
   baudrate: 460800
-rate: 5
+rate: 5  # 2026-08-02 FINAL: 5 Hz obe desky — MB vyzaduje shodny rate base+rover a latence tee linky nedovoli 10/10; heading diky MSM4 slim streamu KONECNE jede 5 Hz (byl 1 Hz!)
 nav_rate: 1
 publish:
   all: true

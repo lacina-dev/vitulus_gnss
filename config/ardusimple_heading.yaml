@@ -5,7 +5,7 @@ frame_id: gnss_heading
 config_on_startup: false
 uart1:
   baudrate: 460800
-rate: 5
+rate: 5  # 2026-08-02 FINAL: viz ardusimple_gnss.yaml — 5/5, heading 5 Hz po MSM4 slim fixu
 nav_rate: 1
 publish:
   all: true
