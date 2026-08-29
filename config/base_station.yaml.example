@@ -1,0 +1,29 @@
+# =============================================================================
+# RTK base station position — TEMPLATE. Copy to base_station.local.yaml and
+# fill in YOUR values, then flash them to the base ZED-F9P (UBX CFG-TMODE FIXED).
+#
+#   cp config/base_station.yaml.example config/base_station.local.yaml
+#   # edit base_station.local.yaml with your surveyed position
+#
+# base_station.local.yaml is git-ignored (never distributed). This example is
+# a no-op until you provide real values — scripts/load_base_station.py will
+# tell you loudly if the base position is still the placeholder.
+#
+# HOW TO GET YOUR BASE POSITION (two ways):
+#  1. Survey-in (fresh base, no known point): set survey_in below and let the
+#     board average its position for min_duration_s until acc_limit_m is met.
+#  2. Known ARP (you already surveyed the antenna reference point): enter it in
+#     base_station: as fixed lat/lon/height (WGS84 ellipsoidal height).
+# =============================================================================
+
+mode: fixed                        # fixed | survey_in
+
+base_station:
+  latitude_deg:  FIXME_BASE_LAT    # e.g. 50.1234567   -> CFG_TMODE_LAT  (1e-7 deg)
+  longitude_deg: FIXME_BASE_LON    # e.g. 14.1234567   -> CFG_TMODE_LON  (1e-7 deg)
+  height_m:      FIXME_BASE_HEIGHT # ellipsoidal, m    -> CFG_TMODE_HEIGHT (cm)
+  fixed_pos_acc_m: 0.7             # CFG_TMODE_FIXED_POS_ACC (0.1 mm units)
+
+survey_in:
+  min_duration_s: 300              # CFG_TMODE_SVIN_MIN_DUR
+  acc_limit_m:    0.7              # CFG_TMODE_SVIN_ACC_LIMIT

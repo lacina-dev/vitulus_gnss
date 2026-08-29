@@ -10,3 +10,9 @@ __pycache__/
 *.swp
 *.swo
 *~
+
+# Private base station position and local config dumps — never commit
+config/base_station.local.yaml
+*.local.yaml
+*.local.json
+*bak_gnssdist*
