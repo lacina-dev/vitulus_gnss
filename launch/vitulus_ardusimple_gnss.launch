@@ -14,6 +14,12 @@
     <rosparam command="load" file="$(arg param_path)" />
   </node>
 
+  <!-- Read-only souhrn obou přijímačů pro UI (/gnss_status, JSON 1 Hz): fix,
+       satelity, RTCM korekce, zahřívání. Jen poslouchá topicy ublox_gps,
+       přijímače nekonfiguruje. -->
+  <node pkg="vitulus_gnss" type="gnss_status" name="gnss_status" output="log"
+        respawn="true" respawn_delay="5"/>
+
 <!--  <node pkg="tf" type="static_transform_publisher" name="base_gnsslite" args="-0.160 0.21 0.3 -1.5707963 0 0 /base_link /gnsslite 1"/>-->
 
 </launch>

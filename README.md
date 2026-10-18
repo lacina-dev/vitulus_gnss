@@ -23,6 +23,7 @@ sends a slimmed **MSM4** stream).
 |---|---|
 | `launch/vitulus_ardusimple_gnss.launch` | starts the positioning rover (`ublox_gps` + `config/ardusimple_gnss.yaml`) |
 | `launch/vitulus_ardusimple_heading.launch` | starts the heading rover |
+| `nodes/gnss_status` | read-only status of both receivers for the UI → `/gnss_status` (JSON, 1 Hz): fix, satellites, RTCM corrections, warm-up time to RTK, likely reason when not RTK; started by the positioning launch |
 | `launch/mapviz.launch` | optional mapviz + origin init for visualisation |
 | `config/ardusimple_gnss.yaml` | **driver** params for the positioning board (device, baud, rate) |
 | `config/ardusimple_heading.yaml` | driver params for the heading board |

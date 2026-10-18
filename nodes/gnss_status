@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""gnss_status — read-only souhrn stavu obou F9P přijímačů pro UI (1 Hz JSON).
+
+Proč: po rebootu trvá RTK (hlavně heading) dlouho a nebylo vidět PROČ. Tenhle
+uzel jen POSLOUCHÁ topicy, které ublox_gps už publikuje (publish: all), nic
+nekonfiguruje a nic neposílá do přijímačů:
+
+  /<rx>/navpvt        fixType, carrSoln, diffSoln, numSV, hAcc, flags3.lastCorrectionAge
+  /<rx>/navsat        viditelné / použité SV po konstelacích, SV s RTCM korekcí
+  /<rx>/rxmrtcm       každá přijatá RTCM zpráva (typ, CRC, použita/nepoužita)
+  /<rx>/navrelposned  relativní řešení (pozice: vůči base; heading: vůči moving base)
+  /<rx>/navstatus     msss = čas od startu přijímače, ttff
+
+Výstup: /gnss_status (std_msgs/String, JSON, 1 Hz) se dvěma přijímači:
+  gnss          = pozice (RTCM z base stanice)
+  gnss_heading  = orientace (moving-base RTCM 4072 + MSM z pozičního přijímače)
+
+Zahřívání: pro každý start přijímače (msss) si pamatuje, za jak dlouho přišel
+3D fix / float / RTK. Historie v ~/.ros/vitulus_gnss_warmup.json → UI ukáže
+„po rebootu obvykle ~N min“.
+"""
+import json
+import os
+import threading
+import time
+from collections import deque
+
+import rospy
+from std_msgs.msg import String
+from ublox_msgs.msg import NavPVT, NavSAT, RxmRTCM, NavRELPOSNED9, NavSTATUS
+
+RX = (
+    ('gnss', 'position'),
+    ('gnss_heading', 'heading'),
+)
+GNSS_ID = {0: 'G', 1: 'S', 2: 'E', 3: 'C', 5: 'J', 6: 'R', 7: 'I'}
+# NAV-PVT flags3 bits 1..4 lastCorrectionAge → horní mez v sekundách (None = n/a)
+CORR_AGE = {0: None, 1: 1, 2: 2, 3: 5, 4: 10, 5: 15, 6: 20, 7: 30, 8: 45,
+            9: 60, 10: 90, 11: 120, 12: 999}
+RTCM_WIN = 10.0          # okno pro msg/s a „typy v posledních N s“
+HIST_FILE = os.path.expanduser('~/.ros/vitulus_gnss_warmup.json')
+HIST_MAX = 30
+
+
+class Rx(object):
+    def __init__(self, name, role):
+        self.name, self.role = name, role
+        self.lock = threading.Lock()
+        self.pvt = None
+        self.pvt_t = 0.0
+        self.sat = None
+        self.sat_t = 0.0
+        self.rel = None
+        self.rel_t = 0.0
+        self.st = None
+        self.st_t = 0.0
+        self.rtcm = deque()          # (t, type, used, crc_fail)
+        self.rtcm_last = {}          # type -> (t, used)
+        self.rtcm_total = 0
+        # zahřívání aktuálního startu přijímače
+        self.boot_wall = None        # wall time startu přijímače (now - msss)
+        self.last_msss = None
+        self.mark = {}               # 'fix'/'float'/'rtk' -> s od startu
+        self.observed_from = None    # msss (s) kdy uzel začal sledovat tento start
+        self.rtk_since = None
+        self.rtk_drops = 0
+        self.was_rtk = False
+
+    # ---- callbacky -----------------------------------------------------
+    def cb_pvt(self, m):
+        with self.lock:
+            self.pvt, self.pvt_t = m, time.time()
+
+    def cb_sat(self, m):
+        with self.lock:
+            self.sat, self.sat_t = m, time.time()
+
+    def cb_rel(self, m):
+        with self.lock:
+            self.rel, self.rel_t = m, time.time()
+
+    def cb_st(self, m):
+        with self.lock:
+            self.st, self.st_t = m, time.time()
+
+    def cb_rtcm(self, m):
+        now = time.time()
+        used = (m.flags >> 1) & 3            # 0 neznámo, 1 nepoužita, 2 použita
+        crc = bool(m.flags & 1)
+        with self.lock:
+            self.rtcm.append((now, m.msgType, used, crc))
+            self.rtcm_last[m.msgType] = (now, used)
+            self.rtcm_total += 1
+
+
+def carr_pvt(m):
+    return (m.flags >> 6) & 3 if m else 0
+
+
+def rel_flags(m):
+    f = m.flags
+    return {
+        'fix_ok': bool(f & 1), 'diff': bool(f & 2), 'valid': bool(f & 4),
+        'carr': (f >> 3) & 3, 'moving': bool(f & 32),
+        'ref_pos_miss': bool(f & 64), 'ref_obs_miss': bool(f & 128),
+        'hdg_valid': bool(f & 256),
+    }
+
+
+class GnssStatus(object):
+    def __init__(self):
+        self.rx = {}
+        for name, role in RX:
+            r = Rx(name, role)
+            self.rx[name] = r
+            rospy.Subscriber('/%s/navpvt' % name, NavPVT, r.cb_pvt, queue_size=2)
+            rospy.Subscriber('/%s/navsat' % name, NavSAT, r.cb_sat, queue_size=1)
+            rospy.Subscriber('/%s/rxmrtcm' % name, RxmRTCM, r.cb_rtcm, queue_size=50)
+            rospy.Subscriber('/%s/navrelposned' % name, NavRELPOSNED9, r.cb_rel, queue_size=2)
+            rospy.Subscriber('/%s/navstatus' % name, NavSTATUS, r.cb_st, queue_size=2)
+        self.hist = self._load_hist()
+        self.t0 = time.time()
+        self.pub = rospy.Publisher('/gnss_status', String, queue_size=1, latch=True)
+
+    # ---- historie zahřívání -------------------------------------------
+    def _load_hist(self):
+        try:
+            with open(HIST_FILE) as fh:
+                h = json.load(fh)
+            return h if isinstance(h, list) else []
+        except Exception:
+            return []
+
+    def _save_hist(self):
+        try:
+            tmp = HIST_FILE + '.tmp'
+            with open(tmp, 'w') as fh:
+                json.dump(self.hist[-HIST_MAX:], fh)
+            os.replace(tmp, HIST_FILE)
+        except Exception as e:
+            rospy.logwarn_throttle(600, 'gnss_status: historii nelze uložit: %s' % e)
+
+    def _hist_rec(self, r):
+        for h in reversed(self.hist):
+            if h.get('rx') == r.name and abs(h.get('boot', 0) - r.boot_wall) < 30:
+                return h
+        return None
+
+    def _warm(self, r, now, msss_s, fixtype, rtk, flt):
+        """Sleduje start přijímače a časy prvního fixu / floatu / RTK."""
+        new_boot = (r.last_msss is None) or (msss_s + 5 < r.last_msss)
+        r.last_msss = msss_s
+        if new_boot:
+            r.boot_wall = now - msss_s
+            r.mark = {}
+            r.rtk_since = None
+            r.rtk_drops = 0
+            r.was_rtk = False
+            old = self._hist_rec(r)
+            if old:                              # restart uzlu během téhož startu
+                r.mark = dict(old.get('mark', {}))
+            # co se stalo, když uzel neběžel, neznáme → sledujeme až od teď
+            r.observed_from = msss_s
+        changed = False
+        for key, cond in (('fix', fixtype >= 3), ('float', flt or rtk), ('rtk', rtk)):
+            if cond and key not in r.mark:
+                # dorazilo dřív, než jsme začali sledovat → čas neznáme
+                r.mark[key] = round(msss_s, 1) if r.observed_from < 20 or msss_s - r.observed_from > 3 else None
+                changed = True
+        if rtk and not r.was_rtk:
+            r.rtk_since = now
+        if not rtk and r.was_rtk:
+            r.rtk_drops += 1
+            r.rtk_since = None
+        r.was_rtk = rtk
+        if changed:
+            rec = self._hist_rec(r)
+            if rec is None:
+                rec = {'rx': r.name, 'boot': round(r.boot_wall, 1)}
+                self.hist.append(rec)
+            rec['mark'] = r.mark
+            rec['observed_from'] = r.observed_from
+            self._save_hist()
+
+    def _typical_rtk(self, r):
+        v = sorted(h['mark']['rtk'] for h in self.hist
+                   if h.get('rx') == r.name and isinstance(h.get('mark', {}).get('rtk'), (int, float))
+                   and h.get('boot', 0) != round(r.boot_wall or 0, 1))
+        if not v:
+            return None, 0
+        return v[len(v) // 2], len(v)
+
+    # ---- souhrn jednoho přijímače --------------------------------------
+    def summary(self, r, now, pos_rtk):
+        with r.lock:
+            pvt, sat, rel, st = r.pvt, r.sat, r.rel, r.st
+            pvt_age = now - r.pvt_t if r.pvt_t else None
+            sat_age = now - r.sat_t if r.sat_t else None
+            rel_age = now - r.rel_t if r.rel_t else None
+            while r.rtcm and now - r.rtcm[0][0] > RTCM_WIN:
+                r.rtcm.popleft()
+            win = list(r.rtcm)
+            last = dict(r.rtcm_last)
+            total = r.rtcm_total
+        o = {'role': r.role, 'alive': pvt_age is not None and pvt_age < 3.0}
+        # ---- PVT
+        fixtype = pvt.fixType if pvt else 0
+        carr = carr_pvt(pvt)
+        o['pvt'] = None if not pvt else {
+            'fix_type': pvt.fixType, 'fix_ok': bool(pvt.flags & 1),
+            'diff': bool(pvt.flags & 2), 'carr': carr, 'num_sv': pvt.numSV,
+            'h_acc_mm': pvt.hAcc, 'v_acc_mm': pvt.vAcc, 'pdop': pvt.pDOP / 100.0,
+            'corr_age_max_s': CORR_AGE.get((pvt.reserved1[0] >> 1) & 15) if pvt.reserved1 else None,
+            'age_s': round(pvt_age, 1),
+        }
+        # ---- NAV-SAT
+        if sat and sat_age is not None and sat_age < 15:      # NAV-SAT chodí ~0.2 Hz
+            vis = used = corr = 0
+            per = {}
+            for s in sat.sv:
+                if s.cno <= 0:
+                    continue
+                vis += 1
+                g = GNSS_ID.get(s.gnssId, '?')
+                p = per.setdefault(g, [0, 0])
+                p[0] += 1
+                if s.flags & 8:
+                    used += 1
+                    p[1] += 1
+                if s.flags & (1 << 21):          # crCorrUsed: fázové korekce použity
+                    corr += 1
+            o['sat'] = {'visible': vis, 'used': used, 'carrier_corr': corr,
+                        'per': {k: {'vis': v[0], 'used': v[1]} for k, v in sorted(per.items())}}
+        else:
+            o['sat'] = None
+        # ---- RTCM
+        types = {}
+        for t, typ, used, crc in win:
+            d = types.setdefault(typ, {'n': 0, 'used': 0, 'crc': 0})
+            d['n'] += 1
+            d['used'] += 1 if used == 2 else 0
+            d['crc'] += 1 if crc else 0
+        span = max(1.0, min(RTCM_WIN, now - self.t0))   # po startu uzlu kratší okno
+        for typ, d in types.items():
+            d['rate'] = round(d['n'] / span, 1)
+            d['age_s'] = round(now - last[typ][0], 1)
+        last_t = max([v[0] for v in last.values()]) if last else None
+        n_win = len(win)
+        o['rtcm'] = {
+            'rate': round(n_win / span, 1),
+            'last_age_s': round(now - last_t, 1) if last_t else None,
+            'used_frac': round(sum(1 for w in win if w[2] == 2) / float(n_win), 2) if n_win else None,
+            'crc_fail': sum(1 for w in win if w[3]),
+            'types': {str(k): v for k, v in sorted(types.items())},
+            'total': total,
+            'source': 'base' if r.role == 'position' else 'moving_base',
+        }
+        # ---- RELPOSNED
+        if rel and rel_age is not None and rel_age < 5:
+            f = rel_flags(rel)
+            f['len_m'] = round((rel.relPosLength + rel.relPosHPLength * 0.01) / 100.0, 3)
+            f['hdg_deg'] = round(rel.relPosHeading * 1e-5, 2)
+            f['hdg_acc_deg'] = round(rel.accHeading * 1e-5, 3)
+            f['acc_len_mm'] = rel.accLength * 0.1
+            o['rel'] = f
+        else:
+            o['rel'] = None
+        # ---- stav / fix label
+        if r.role == 'heading':
+            rl = o['rel'] or {}
+            rcarr = rl.get('carr', 0)
+            rtk = rcarr == 2 and rl.get('hdg_valid', False)
+            flt = rcarr == 1
+        else:
+            rtk = carr == 2
+            flt = carr == 1
+        if not o['alive']:
+            label = 'OFF'
+        elif rtk:
+            label = 'RTK'
+        elif flt:
+            label = 'FLOAT'
+        elif fixtype >= 3 and (pvt.flags & 2):
+            label = 'DGNSS'
+        elif fixtype >= 3:
+            label = '3D'
+        elif fixtype == 2:
+            label = '2D'
+        else:
+            label = 'NONE'
+        o['label'] = label
+        o['rtk'] = rtk
+        # ---- zahřívání
+        msss = (st.msss / 1000.0) if (st is not None) else None
+        if msss is not None and o['alive']:
+            self._warm(r, now, msss, fixtype, rtk, flt)
+            o['up_s'] = round(msss + (now - r.st_t if r.st_t else 0), 0)
+            o['ttff_s'] = round(st.ttff / 1000.0, 1)
+        else:
+            o['up_s'] = None
+            o['ttff_s'] = None
+        o['warm'] = dict(r.mark)
+        o['rtk_for_s'] = round(now - r.rtk_since) if r.rtk_since else None
+        o['rtk_drops'] = r.rtk_drops
+        typ, n = self._typical_rtk(r)
+        o['typical_rtk_s'] = typ
+        o['typical_n'] = n
+        o['reason'] = self.reason(o, pos_rtk)
+        return o
+
+    @staticmethod
+    def reason(o, pos_rtk):
+        """Nejpravděpodobnější důvod, proč přijímač NENÍ v RTK (kód pro UI)."""
+        if o['rtk']:
+            return None
+        if not o['alive']:
+            return 'no_data'
+        p = o['pvt'] or {}
+        if p.get('fix_type', 0) < 3:
+            return 'no_fix'
+        rt = o['rtcm']
+        if rt['last_age_s'] is None or rt['last_age_s'] > RTCM_WIN:
+            return 'no_corr_mb' if o['role'] == 'heading' else 'no_corr'
+        if rt['last_age_s'] > 3.0:
+            return 'corr_stale'
+        if rt['used_frac'] is not None and rt['used_frac'] < 0.2:
+            return 'corr_unused'
+        rl = o['rel'] or {}
+        if o['role'] == 'heading' and (rl.get('ref_obs_miss') or rl.get('ref_pos_miss')):
+            return 'mb_incomplete'
+        s = o['sat'] or {}
+        if (s.get('used') is not None and s['used'] < 12) or p.get('num_sv', 0) < 12:
+            return 'few_sv'
+        if o['role'] == 'heading' and not pos_rtk:
+            return 'pos_not_rtk'
+        return 'float'   # korekce OK, satelitů dost → řeší ambiguity (normální zahřívání)
+
+    def tick(self, _evt=None):
+        now = time.time()
+        pos = self.summary(self.rx['gnss'], now, True)
+        hdg = self.summary(self.rx['gnss_heading'], now, pos['rtk'])
+        self.pub.publish(String(data=json.dumps(
+            {'t': round(now, 1), 'rx': {'gnss': pos, 'gnss_heading': hdg}},
+            separators=(',', ':'))))
+
+
+if __name__ == '__main__':
+    rospy.init_node('gnss_status')
+    g = GnssStatus()
+    rospy.Timer(rospy.Duration(1.0), g.tick)
+    rospy.spin()
