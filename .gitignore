@@ -16,3 +16,7 @@ config/base_station.local.yaml
 *.local.yaml
 *.local.json
 *bak_gnssdist*
+*.bak_*
+*_bak_*
+*.orig
+.claude/
